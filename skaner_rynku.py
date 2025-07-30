@@ -38,6 +38,7 @@ def znajdz_spolki_wzrostowe(tickers: list, limit_spolek: int = 4000):
     - Wzrost 25-100% w ostatnim półroczu.
     - Kapitalizacja rynkowa > 100 mln USD.
     - Wzrost w ciągu ostatnich 3 dni mniejszy niż wzrost S&P 500.
+    - Brak spadku kursu w ciągu ostatnich 6 dni roboczych.
     
     Args:
         tickers (list): Lista tickerów do analizy.
@@ -50,6 +51,28 @@ def znajdz_spolki_wzrostowe(tickers: list, limit_spolek: int = 4000):
     tickers_do_analizy = tickers[:limit_spolek]
     print(f"Rozpoczynam analizę {len(tickers_do_analizy)} spółek...")
 
+    # Krok 0: Pobierz dane dla S&P 500 PRZED głównym zapytaniem, aby uniknąć błędów w yfinance
+    print("\nPobieranie danych dla S&P 500 (^GSPC)...")
+    sp500_data = yf.download('^GSPC', period='5d', auto_adjust=True, progress=False)
+    sp500_wzrost_3d = None
+    if len(sp500_data) >= 4:
+        # Odporne na błędy pobieranie kolumny 'Close', niezależnie od formatu zwracanego przez yfinance
+        if isinstance(sp500_data.columns, pd.MultiIndex):
+            # Jeśli kolumny są wielopoziomowe, 'Close' może być na górnym poziomie.
+            # Wybieramy go, a następnie bierzemy pierwszą kolumnę danych.
+            close_prices = sp500_data['Close'].iloc[:, 0]
+        else:
+            close_prices = sp500_data['Close']
+
+        sp500_cena_teraz = close_prices.iloc[-1]
+        sp500_cena_3d_temu = close_prices.iloc[-4]
+        
+        if sp500_cena_3d_temu > 0:
+            sp500_wzrost_3d = (sp500_cena_teraz / sp500_cena_3d_temu - 1) * 100
+            print(f"3-dniowy wzrost S&P 500: {sp500_wzrost_3d:.2f}%")
+    else:
+        print("Ostrzeżenie: Nie udało się pobrać wystarczających danych dla S&P 500, aby obliczyć 3-dniowy wzrost. Ten krok zostanie pominięty.")
+
     # Pobieramy dane z ostatnich 7 miesięcy, aby mieć pewność, że pokryjemy 6 miesięcy handlowych.
     # auto_adjust=True automatycznie dostosowuje ceny o dywidendy i splity, co jest lepsze do analizy zwrotów.
     print("Pobieranie danych historycznych dla spółek...")
@@ -58,18 +81,6 @@ def znajdz_spolki_wzrostowe(tickers: list, limit_spolek: int = 4000):
     if data.empty:
         print("Nie udało się pobrać danych dla analizy wzrostu.")
         return
-
-    # Pobieranie danych dla S&P 500 do porównania
-    print("\nPobieranie danych dla S&P 500 (^GSPC)...")
-    sp500_data = yf.download('^GSPC', period='5d', auto_adjust=True, progress=False)
-    sp500_wzrost_3d = None
-    if len(sp500_data) >= 4:
-        sp500_cena_teraz = sp500_data['Close'].iloc[-1]
-        sp500_cena_3d_temu = sp500_data['Close'].iloc[-4]
-        sp500_wzrost_3d = (sp500_cena_teraz / sp500_cena_3d_temu - 1) * 100
-        print(f"3-dniowy wzrost S&P 500: {sp500_wzrost_3d:.2f}%")
-    else:
-        print("Ostrzeżenie: Nie udało się pobrać wystarczających danych dla S&P 500, aby obliczyć 3-dniowy wzrost. Ten krok zostanie pominięty.")
 
     # Definicja okresów w dniach handlowych (przybliżenie)
     dni_kwartal = 63
@@ -175,11 +186,33 @@ def znajdz_spolki_wzrostowe(tickers: list, limit_spolek: int = 4000):
             continue
 
     if not finalne_spolki:
-        print("\nNie znaleziono żadnych spółek spełniających wszystkie trzy kryteria.")
+        print("\nNie znaleziono żadnych spółek spełniających pierwsze trzy kryteria (wzrost, kap., porównanie z S&P500).")
+        return
+
+    # Krok 4: Eliminacja spółek, które spadły w ciągu ostatnich 6 dni.
+    print(f"\nKrok 4: Filtrowanie {len(finalne_spolki)} spółek pod kątem braku spadku w ostatnich 6 dniach roboczych...")
+    ostateczne_spolki = []
+    for kandydat in finalne_spolki:
+        try:
+            historia_spolki = data[kandydat['Ticker']]['Close'].dropna()
+
+            # Potrzebujemy co najmniej 7 dni danych (dzisiaj + 6 dni wstecz)
+            if len(historia_spolki) >= 7:
+                cena_teraz = historia_spolki.iloc[-1]
+                cena_6d_temu = historia_spolki.iloc[-7]
+
+                # Sprawdzamy, czy cena nie spadła
+                if cena_teraz >= cena_6d_temu:
+                    ostateczne_spolki.append(kandydat)
+        except (KeyError, IndexError):
+            continue
+
+    if not ostateczne_spolki:
+        print("\nNie znaleziono żadnych spółek spełniających wszystkie cztery kryteria.")
     else:
         # Przygotowanie danych do wyświetlenia
         finalne_spolki_dane = []
-        for spolka in finalne_spolki:
+        for spolka in ostateczne_spolki:
             market_cap = spolka['marketCap']
             kapitalizacja_str = f"{market_cap / 1_000_000_000:.2f}B" if market_cap >= 1_000_000_000 else f"{market_cap / 1_000_000:.2f}M"
             finalne_spolki_dane.append({
@@ -192,6 +225,27 @@ def znajdz_spolki_wzrostowe(tickers: list, limit_spolek: int = 4000):
         wyniki_df = wyniki_df[['Ticker', 'Wzrost (3D)', 'Wzrost (kwartał)', 'Wzrost (pół roku)', 'Kapitalizacja']]
         print(wyniki_df.to_string(index=False))
 
+        # Zapisywanie kluczowych wyników do pliku tekstowego
+        nazwa_pliku = 'wynik.txt'
+        try:
+            with open(nazwa_pliku, 'w') as f:
+                for spolka in ostateczne_spolki:
+                    # Format: Ticker, wzrost 3 mies., wzrost 6 mies., wzrost 3 dni
+                    linia = (
+                        f"{spolka['Ticker']}, "
+                        f"{spolka['wzrost_kwartalny']:.2f}, "
+                        f"{spolka['wzrost_polroczny']:.2f}, "
+                        f"{spolka['wzrost_3d']:.2f}\n"
+                    )
+                    f.write(linia)
+                
+                # Ostatnia linia z wynikiem S&P 500 dla spójności
+                if sp500_wzrost_3d is not None:
+                    f.write(f"SP500, {sp500_wzrost_3d:.2f}\n")
+            print(f"\nKluczowe dane zostały zapisane do pliku: {nazwa_pliku}")
+        except IOError as e:
+            print(f"\nNie udało się zapisać wyników do pliku. Błąd: {e}")
+
     # Podsumowanie S&P 500 na koniec
     if not sp500_data.empty and len(sp500_data) > 1:
         zmiany_dzienne = sp500_data['Close'].diff().dropna()
@@ -202,4 +256,4 @@ def znajdz_spolki_wzrostowe(tickers: list, limit_spolek: int = 4000):
 if __name__ == "__main__":
     lista_spolek = pobierz_liste_spolek_nasdaq()
     if lista_spolek:
-        znajdz_spolki_wzrostowe(lista_spolek, limit_spolek=2000)
+        znajdz_spolki_wzrostowe(lista_spolek, limit_spolek=300)
